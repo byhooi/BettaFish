@@ -4,44 +4,83 @@ Flask主应用 - 统一管理三个Streamlit应用
 
 import os
 import sys
+
+# 【修复】尽早设置环境变量，确保所有模块都使用无缓冲模式
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['PYTHONUTF8'] = '1'
+os.environ['PYTHONUNBUFFERED'] = '1'  # 禁用Python输出缓冲，确保日志实时输出
+
 import subprocess
 import time
-import json
 import threading
+import json
 from datetime import datetime
-from queue import Queue, Empty
+from queue import Queue
 from flask import Flask, render_template, request, jsonify, Response
 from flask_socketio import SocketIO, emit
-import signal
 import atexit
 import requests
-import logging
+from loguru import logger
 import importlib
-import re
 from pathlib import Path
+from MindSpider.main import MindSpider
+from utils.knowledge_logger import (
+    append_knowledge_log,
+    compact_records as _compact_records,
+    init_knowledge_log,
+)
 
 # 导入ReportEngine
 try:
     from ReportEngine.flask_interface import report_bp, initialize_report_engine
     REPORT_ENGINE_AVAILABLE = True
 except ImportError as e:
-    print(f"ReportEngine导入失败: {e}")
+    logger.error(f"ReportEngine导入失败: {e}")
     REPORT_ENGINE_AVAILABLE = False
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'Dedicated-to-creating-a-concise-and-versatile-public-opinion-analysis-platform'
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# eventlet 在客户端主动断开时偶尔会抛出 ConnectionAbortedError，这里做一次防御性包裹，
+# 避免无意义的堆栈污染日志（仅在 eventlet 可用时启用）。
+def _patch_eventlet_disconnect_logging():
+    try:
+        import eventlet.wsgi  # type: ignore
+    except Exception as exc:  # pragma: no cover - 仅在生产环境有效
+        logger.debug(f"eventlet 不可用，跳过断开补丁: {exc}")
+        return
+
+    try:
+        original_finish = eventlet.wsgi.HttpProtocol.finish  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover
+        logger.debug(f"eventlet 缺少 HttpProtocol.finish，跳过断开补丁: {exc}")
+        return
+
+    def _safe_finish(self, *args, **kwargs):  # pragma: no cover - 运行时才会触发
+        try:
+            return original_finish(self, *args, **kwargs)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            try:
+                environ = getattr(self, 'environ', {}) or {}
+                method = environ.get('REQUEST_METHOD', '')
+                path = environ.get('PATH_INFO', '')
+                logger.warning(f"客户端已主动断开，忽略异常: {method} {path} ({exc})")
+            except Exception:
+                logger.warning(f"客户端已主动断开，忽略异常: {exc}")
+            return
+
+    eventlet.wsgi.HttpProtocol.finish = _safe_finish  # type: ignore[attr-defined]
+    logger.info("已对 eventlet 连接中断进行安全防护")
+
+_patch_eventlet_disconnect_logging()
+
 # 注册ReportEngine Blueprint
 if REPORT_ENGINE_AVAILABLE:
     app.register_blueprint(report_bp, url_prefix='/api/report')
-    print("ReportEngine接口已注册")
+    logger.info("ReportEngine接口已注册")
 else:
-    print("ReportEngine不可用，跳过接口注册")
-
-# 设置UTF-8编码环境
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-os.environ['PYTHONUTF8'] = '1'
+    logger.info("ReportEngine不可用，跳过接口注册")
 
 # 创建日志目录
 LOG_DIR = Path('logs')
@@ -50,6 +89,9 @@ LOG_DIR.mkdir(exist_ok=True)
 CONFIG_MODULE_NAME = 'config'
 CONFIG_FILE_PATH = Path(__file__).resolve().parent / 'config.py'
 CONFIG_KEYS = [
+    'HOST',
+    'PORT',
+    'DB_DIALECT',
     'DB_HOST',
     'DB_PORT',
     'DB_USER',
@@ -75,7 +117,11 @@ CONFIG_KEYS = [
     'KEYWORD_OPTIMIZER_BASE_URL',
     'KEYWORD_OPTIMIZER_MODEL_NAME',
     'TAVILY_API_KEY',
-    'BOCHA_WEB_SEARCH_API_KEY'
+    'SEARCH_TOOL_TYPE',
+    'BOCHA_WEB_SEARCH_API_KEY',
+    'ANSPIRE_API_KEY',
+    'GRAPHRAG_ENABLED',
+    'GRAPHRAG_MAX_QUERIES'
 ]
 
 
@@ -95,19 +141,24 @@ def _load_config_module():
 
 def read_config_values():
     """Return the current configuration values that are exposed to the frontend."""
-    module = _load_config_module()
-    if not module:
+    try:
+        # 重新加载配置以获取最新的 Settings 实例
+        from config import reload_settings, settings
+        reload_settings()
+        
+        values = {}
+        for key in CONFIG_KEYS:
+            # 从 Pydantic Settings 实例读取值
+            value = getattr(settings, key, None)
+            # Convert to string for uniform handling on the frontend.
+            if value is None:
+                values[key] = ''
+            else:
+                values[key] = str(value)
+        return values
+    except Exception as exc:
+        logger.exception(f"读取配置失败: {exc}")
         return {}
-
-    values = {}
-    for key in CONFIG_KEYS:
-        value = getattr(module, key, '')
-        # Convert to string for uniform handling on the frontend.
-        if value is None:
-            values[key] = ''
-        else:
-            values[key] = str(value)
-    return values
 
 
 def _serialize_config_value(value):
@@ -125,42 +176,66 @@ def _serialize_config_value(value):
 
 
 def write_config_values(updates):
-    """Persist configuration updates into config.py."""
-    if not CONFIG_FILE_PATH.exists():
-        raise FileNotFoundError("配置文件 config.py 不存在")
-
-    content = CONFIG_FILE_PATH.read_text(encoding='utf-8')
-
+    """Persist configuration updates to .env file (Pydantic Settings source)."""
+    from pathlib import Path
+    
+    # 确定 .env 文件路径（与 config.py 中的逻辑一致）
+    project_root = Path(__file__).resolve().parent
+    cwd_env = Path.cwd() / ".env"
+    env_file_path = cwd_env if cwd_env.exists() else (project_root / ".env")
+    
+    # 读取现有的 .env 文件内容
+    env_lines = []
+    env_key_indices = {}  # 记录每个键在文件中的索引位置
+    if env_file_path.exists():
+        env_lines = env_file_path.read_text(encoding='utf-8').splitlines()
+        # 提取已存在的键及其索引
+        for i, line in enumerate(env_lines):
+            line_stripped = line.strip()
+            if line_stripped and not line_stripped.startswith('#'):
+                if '=' in line_stripped:
+                    key = line_stripped.split('=')[0].strip()
+                    env_key_indices[key] = i
+    
+    # 更新或添加配置项
     for key, raw_value in updates.items():
-        formatted_value = _serialize_config_value(raw_value)
-        pattern = re.compile(
-            rf'^(\s*{key}\s*=\s*)(["\'].*?["\']|None|True|False|[0-9\.-]+)(.*)$',
-            re.MULTILINE
-        )
-
-        def replace(match):
-            prefix, _, suffix = match.groups()
-            return f"{prefix}{formatted_value}{suffix}"
-
-        new_content, count = pattern.subn(replace, content, count=1)
-
-        if count == 0:
-            # Append the new key if it was not present.
-            if not new_content.endswith('\n'):
-                new_content += '\n'
-            new_content += f'{key} = {formatted_value}\n'
-
-        content = new_content
-
-    CONFIG_FILE_PATH.write_text(content, encoding='utf-8')
-    # Reload the module so the rest of the app observes the new values when possible.
+        # 格式化值用于 .env 文件（不需要引号，除非是字符串且包含空格）
+        if raw_value is None or raw_value == '':
+            env_value = ''
+        elif isinstance(raw_value, (int, float)):
+            env_value = str(raw_value)
+        elif isinstance(raw_value, bool):
+            env_value = 'True' if raw_value else 'False'
+        else:
+            value_str = str(raw_value)
+            # 如果包含空格或特殊字符，需要引号
+            if ' ' in value_str or '\n' in value_str or '#' in value_str:
+                escaped = value_str.replace('\\', '\\\\').replace('"', '\\"')
+                env_value = f'"{escaped}"'
+            else:
+                env_value = value_str
+        
+        # 更新或添加配置项
+        if key in env_key_indices:
+            # 更新现有行
+            env_lines[env_key_indices[key]] = f'{key}={env_value}'
+        else:
+            # 添加新行到文件末尾
+            env_lines.append(f'{key}={env_value}')
+    
+    # 写入 .env 文件
+    env_file_path.parent.mkdir(parents=True, exist_ok=True)
+    env_file_path.write_text('\n'.join(env_lines) + '\n', encoding='utf-8')
+    
+    # 重新加载配置模块（这会重新读取 .env 文件并创建新的 Settings 实例）
     _load_config_module()
 
 
 system_state_lock = threading.Lock()
 system_state = {
     'started': False,
-    'starting': False
+    'starting': False,
+    'shutdown_in_progress': False
 }
 
 
@@ -189,11 +264,25 @@ def _prepare_system_start():
         system_state['starting'] = True
         return True, None
 
+def _mark_shutdown_requested():
+    """标记关机已请求；若已有关机流程则返回 False。"""
+    with system_state_lock:
+        if system_state.get('shutdown_in_progress'):
+            return False
+        system_state['shutdown_in_progress'] = True
+        return True
+
 
 def initialize_system_components():
     """启动所有依赖组件（Streamlit 子应用、ForumEngine、ReportEngine）。"""
     logs = []
     errors = []
+    
+    spider = MindSpider()
+    if spider.initialize_database():
+        logger.info("数据库初始化成功")
+    else:
+        logger.error("数据库初始化失败")
 
     try:
         stop_forum_engine()
@@ -201,7 +290,7 @@ def initialize_system_components():
     except Exception as exc:  # pragma: no cover - 安全捕获
         message = f"停止 ForumEngine 时发生异常: {exc}"
         logs.append(message)
-        logging.exception(message)
+        logger.exception(message)
 
     processes['forum']['status'] = 'stopped'
 
@@ -253,7 +342,7 @@ def initialize_system_components():
             try:
                 stop_forum_engine()
             except Exception:  # pragma: no cover
-                logging.exception("停止ForumEngine失败")
+                logger.exception("停止ForumEngine失败")
         return False, logs, errors
 
     return True, logs, []
@@ -268,118 +357,130 @@ def init_forum_log():
             with open(forum_log_file, 'w', encoding='utf-8') as f:
                 start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 f.write(f"=== ForumEngine 系统初始化 - {start_time} ===\n")
-            print(f"ForumEngine: forum.log 已初始化")
+            logger.info(f"ForumEngine: forum.log 已初始化")
         else:
             with open(forum_log_file, 'w', encoding='utf-8') as f:
                 start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 f.write(f"=== ForumEngine 系统初始化 - {start_time} ===\n")
-            print(f"ForumEngine: forum.log 已初始化")
+            logger.info(f"ForumEngine: forum.log 已初始化")
     except Exception as e:
-        print(f"ForumEngine: 初始化forum.log失败: {e}")
+        logger.exception(f"ForumEngine: 初始化forum.log失败: {e}")
 
 # 初始化forum.log
 init_forum_log()
+
+# 初始化 knowledge_query.log
+init_knowledge_log()
 
 # 启动ForumEngine智能监控
 def start_forum_engine():
     """启动ForumEngine论坛"""
     try:
         from ForumEngine.monitor import start_forum_monitoring
-        print("ForumEngine: 启动论坛...")
+        logger.info("ForumEngine: 启动论坛...")
         success = start_forum_monitoring()
         if not success:
-            print("ForumEngine: 论坛启动失败")
+            logger.info("ForumEngine: 论坛启动失败")
     except Exception as e:
-        print(f"ForumEngine: 启动论坛失败: {e}")
+        logger.exception(f"ForumEngine: 启动论坛失败: {e}")
 
 # 停止ForumEngine智能监控
 def stop_forum_engine():
     """停止ForumEngine论坛"""
     try:
         from ForumEngine.monitor import stop_forum_monitoring
-        print("ForumEngine: 停止论坛...")
+        logger.info("ForumEngine: 停止论坛...")
         stop_forum_monitoring()
-        print("ForumEngine: 论坛已停止")
+        logger.info("ForumEngine: 论坛已停止")
     except Exception as e:
-        print(f"ForumEngine: 停止论坛失败: {e}")
+        logger.exception(f"ForumEngine: 停止论坛失败: {e}")
 
 def parse_forum_log_line(line):
     """解析forum.log行内容，提取对话信息"""
     import re
     
-    # 匹配格式: [时间] [来源] 内容
-    pattern = r'\[(\d{2}:\d{2}:\d{2})\]\s*\[([A-Z]+)\]\s*(.*)'
+    # 匹配格式: [时间] [来源] 内容（来源允许大小写及空格）
+    pattern = r'\[(\d{2}:\d{2}:\d{2})\]\s*\[([^\]]+)\]\s*(.*)'
     match = re.match(pattern, line)
     
-    if match:
-        timestamp, source, content = match.groups()
-        
-        # 过滤掉系统消息和空内容
-        if source == 'SYSTEM' or not content.strip():
-            return None
-        
-        # 只处理三个Engine的消息
-        if source not in ['QUERY', 'INSIGHT', 'MEDIA']:
-            return None
-        
-        # 根据来源确定消息类型和发送者
-        message_type = 'agent'
-        sender = f'{source} Engine'
-        
-        return {
-            'type': message_type,
-            'sender': sender,
-            'content': content.strip(),
-            'timestamp': timestamp,
-            'source': source
-        }
+    if not match:
+        return None
+
+    timestamp, raw_source, content = match.groups()
+    source = raw_source.strip().upper()
+
+    # 过滤掉系统消息和空内容
+    if source == 'SYSTEM' or not content.strip():
+        return None
     
-    return None
+    # 支持三个Agent和主持人
+    if source not in ['QUERY', 'INSIGHT', 'MEDIA', 'HOST']:
+        return None
+    
+    # 解码日志中的转义换行，保留多行格式
+    cleaned_content = content.replace('\\n', '\n').replace('\\r', '').strip()
+    
+    # 根据来源确定消息类型和发送者
+    if source == 'HOST':
+        message_type = 'host'
+        sender = 'Forum Host'
+    else:
+        message_type = 'agent'
+        sender = f'{source.title()} Engine'
+    
+    return {
+        'type': message_type,
+        'sender': sender,
+        'content': cleaned_content,
+        'timestamp': timestamp,
+        'source': source
+    }
 
 # Forum日志监听器
+# 存储每个客户端的历史日志发送位置
+forum_log_positions = {}
+
 def monitor_forum_log():
     """监听forum.log文件变化并推送到前端"""
     import time
     from pathlib import Path
-    
+
     forum_log_file = LOG_DIR / "forum.log"
     last_position = 0
     processed_lines = set()  # 用于跟踪已处理的行，避免重复
-    
-    # 如果文件存在，获取初始位置
+
+    # 如果文件存在，获取初始位置但不跳过内容
     if forum_log_file.exists():
         with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            # 初始化时读取所有现有行，避免重复处理
-            existing_lines = f.readlines()
-            for line in existing_lines:
-                line_hash = hash(line.strip())
-                processed_lines.add(line_hash)
+            # 记录文件大小，但不添加到processed_lines
+            # 这样用户打开forum标签时可以获取历史
+            f.seek(0, 2)  # 移到文件末尾
             last_position = f.tell()
-    
+
     while True:
         try:
             if forum_log_file.exists():
                 with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
                     f.seek(last_position)
                     new_lines = f.readlines()
-                    
+
                     if new_lines:
                         for line in new_lines:
                             line = line.rstrip('\n\r')
                             if line.strip():
                                 line_hash = hash(line.strip())
-                                
+
                                 # 避免重复处理同一行
                                 if line_hash in processed_lines:
                                     continue
-                                
+
                                 processed_lines.add(line_hash)
-                                
+
                                 # 解析日志行并发送forum消息
                                 parsed_message = parse_forum_log_line(line)
                                 if parsed_message:
                                     socketio.emit('forum_message', parsed_message)
-                                
+
                                 # 只有在控制台显示forum时才发送控制台消息
                                 timestamp = datetime.now().strftime('%H:%M:%S')
                                 formatted_line = f"[{timestamp}] {line}"
@@ -387,16 +488,18 @@ def monitor_forum_log():
                                     'app': 'forum',
                                     'line': formatted_line
                                 })
-                        
+
                         last_position = f.tell()
-                        
+
                         # 清理processed_lines集合，避免内存泄漏（保留最近1000行的哈希）
                         if len(processed_lines) > 1000:
-                            processed_lines.clear()
-            
+                            # 保留最近500行的哈希
+                            recent_hashes = list(processed_lines)[-500:]
+                            processed_lines = set(recent_hashes)
+
             time.sleep(1)  # 每秒检查一次
         except Exception as e:
-            print(f"Forum日志监听错误: {e}")
+            logger.error(f"Forum日志监听错误: {e}")
             time.sleep(5)
 
 # 启动Forum日志监听线程
@@ -417,6 +520,21 @@ STREAMLIT_SCRIPTS = {
     'query': 'SingleEngineApp/query_engine_streamlit_app.py'
 }
 
+def _log_shutdown_step(message: str):
+    """统一记录关机步骤，便于排查。"""
+    logger.info(f"[Shutdown] {message}")
+
+
+def _describe_running_children():
+    """列出当前存活的子进程。"""
+    running = []
+    for name, info in processes.items():
+        proc = info.get('process')
+        if proc is not None and proc.poll() is None:
+            port_desc = f", port={info.get('port')}" if info.get('port') else ""
+            running.append(f"{name}(pid={proc.pid}{port_desc})")
+    return running
+
 # 输出队列
 output_queues = {
     'insight': Queue(),
@@ -433,7 +551,7 @@ def write_log_to_file(app_name, line):
             f.write(line + '\n')
             f.flush()
     except Exception as e:
-        print(f"Error writing log for {app_name}: {e}")
+        logger.error(f"Error writing log for {app_name}: {e}")
 
 def read_log_from_file(app_name, tail_lines=None):
     """从文件读取日志"""
@@ -450,7 +568,7 @@ def read_log_from_file(app_name, tail_lines=None):
                 return lines[-tail_lines:]
             return lines
     except Exception as e:
-        print(f"Error reading log for {app_name}: {e}")
+        logger.exception(f"Error reading log for {app_name}: {e}")
         return []
 
 def read_process_output(process, app_name):
@@ -520,7 +638,7 @@ def read_process_output(process, app_name):
                             
         except Exception as e:
             error_msg = f"Error reading output for {app_name}: {e}"
-            print(error_msg)
+            logger.exception(error_msg)
             write_log_to_file(app_name, f"[{datetime.now().strftime('%H:%M:%S')}] {error_msg}")
             break
 
@@ -600,18 +718,28 @@ def start_streamlit_app(app_name, script_path, port):
 def stop_streamlit_app(app_name):
     """停止Streamlit应用"""
     try:
-        if processes[app_name]['process'] is None:
+        process = processes[app_name]['process']
+        if process is None:
+            _log_shutdown_step(f"{app_name} 未运行，跳过停止")
             return False, "应用未运行"
         
-        process = processes[app_name]['process']
+        try:
+            pid = process.pid
+        except Exception:
+            pid = 'unknown'
+
+        _log_shutdown_step(f"正在停止 {app_name} (pid={pid})")
         process.terminate()
         
         # 等待进程结束
         try:
             process.wait(timeout=5)
+            _log_shutdown_step(f"{app_name} 退出完成，returncode={process.returncode}")
         except subprocess.TimeoutExpired:
+            _log_shutdown_step(f"{app_name} 终止超时，尝试强制结束 (pid={pid})")
             process.kill()
             process.wait()
+            _log_shutdown_step(f"{app_name} 已强制结束，returncode={process.returncode}")
         
         processes[app_name]['process'] = None
         processes[app_name]['status'] = 'stopped'
@@ -619,7 +747,16 @@ def stop_streamlit_app(app_name):
         return True, f"{app_name} 应用已停止"
         
     except Exception as e:
+        _log_shutdown_step(f"{app_name} 停止失败: {e}")
         return False, f"停止失败: {str(e)}"
+
+HEALTHCHECK_PATH = "/_stcore/health"
+HEALTHCHECK_PROXIES = {'http': None, 'https': None}
+
+
+def _build_healthcheck_url(port):
+    return f"http://127.0.0.1:{port}{HEALTHCHECK_PATH}"
+
 
 def check_app_status():
     """检查应用状态"""
@@ -628,21 +765,24 @@ def check_app_status():
             if info['process'].poll() is None:
                 # 进程仍在运行，检查端口是否可访问
                 try:
-                    response = requests.get(f"http://localhost:{info['port']}", timeout=2)
+                    response = requests.get(
+                        _build_healthcheck_url(info['port']),
+                        timeout=2,
+                        proxies=HEALTHCHECK_PROXIES
+                    )
                     if response.status_code == 200:
                         info['status'] = 'running'
                     else:
                         info['status'] = 'starting'
-                except requests.exceptions.RequestException:
-                    info['status'] = 'starting'
-                except Exception:
+                except Exception as exc:
+                    logger.warning(f"{app_name} 健康检查失败: {exc}")
                     info['status'] = 'starting'
             else:
                 # 进程已结束
                 info['process'] = None
                 info['status'] = 'stopped'
 
-def wait_for_app_startup(app_name, max_wait_time=30):
+def wait_for_app_startup(app_name, max_wait_time=90):
     """等待应用启动完成"""
     import time
     start_time = time.time()
@@ -655,28 +795,126 @@ def wait_for_app_startup(app_name, max_wait_time=30):
             return False, "进程启动失败"
         
         try:
-            response = requests.get(f"http://localhost:{info['port']}", timeout=2)
+            response = requests.get(
+                _build_healthcheck_url(info['port']),
+                timeout=2,
+                proxies=HEALTHCHECK_PROXIES
+            )
             if response.status_code == 200:
                 info['status'] = 'running'
                 return True, "启动成功"
-        except:
-            pass
-        
+        except Exception as exc:
+            logger.warning(f"{app_name} 健康检查失败: {exc}")
+
         time.sleep(1)
-    
+
     return False, "启动超时"
 
 def cleanup_processes():
     """清理所有进程"""
+    _log_shutdown_step("开始串行清理子进程")
     for app_name in STREAMLIT_SCRIPTS:
         stop_streamlit_app(app_name)
-    
+
     processes['forum']['status'] = 'stopped'
     try:
         stop_forum_engine()
     except Exception:  # pragma: no cover
-        logging.exception("停止ForumEngine失败")
+        logger.exception("停止ForumEngine失败")
+    _log_shutdown_step("子进程清理完成")
     _set_system_state(started=False, starting=False)
+
+def cleanup_processes_concurrent(timeout: float = 6.0):
+    """并发清理所有子进程，超时后强制杀掉残留进程。"""
+    _log_shutdown_step(f"开始并发清理子进程（超时 {timeout}s）")
+    _log_shutdown_step("仅终止当前控制台启动并记录的子进程，不做端口扫描")
+    running_before = _describe_running_children()
+    if running_before:
+        _log_shutdown_step("当前存活子进程: " + ", ".join(running_before))
+    else:
+        _log_shutdown_step("未检测到存活子进程，仍将发送关闭指令")
+
+    threads = []
+
+    # 并发关闭 Streamlit 子进程
+    for app_name in STREAMLIT_SCRIPTS:
+        t = threading.Thread(target=stop_streamlit_app, args=(app_name,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # 并发关闭 ForumEngine
+    forum_thread = threading.Thread(target=stop_forum_engine, daemon=True)
+    threads.append(forum_thread)
+    forum_thread.start()
+
+    # 等待所有线程完成，最多 timeout 秒
+    end_time = time.time() + timeout
+    for t in threads:
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
+    # 二次检查：强制杀掉仍存活的子进程
+    for app_name in STREAMLIT_SCRIPTS:
+        proc = processes[app_name]['process']
+        if proc is not None and proc.poll() is None:
+            try:
+                _log_shutdown_step(f"{app_name} 进程仍存活，触发二次终止 (pid={proc.pid})")
+                proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    _log_shutdown_step(f"{app_name} 二次终止失败，尝试kill (pid={proc.pid})")
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    logger.warning(f"{app_name} 进程强制退出失败，继续关机")
+            finally:
+                processes[app_name]['process'] = None
+                processes[app_name]['status'] = 'stopped'
+
+    processes['forum']['status'] = 'stopped'
+    _log_shutdown_step("并发清理结束，标记系统未启动")
+    _set_system_state(started=False, starting=False)
+
+def _schedule_server_shutdown(delay_seconds: float = 0.1):
+    """在清理完成后尽快退出，避免阻塞当前请求。"""
+    def _shutdown():
+        time.sleep(delay_seconds)
+        try:
+            socketio.stop()
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"SocketIO 停止时异常，继续退出: {exc}")
+        _log_shutdown_step("SocketIO 停止指令已发送，即将退出主进程")
+        os._exit(0)
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+
+def _start_async_shutdown(cleanup_timeout: float = 3.0):
+    """异步触发清理并强制退出，避免HTTP请求阻塞。"""
+    _log_shutdown_step(f"收到关机指令，启动异步清理（超时 {cleanup_timeout}s）")
+
+    def _force_exit():
+        _log_shutdown_step("关机超时，触发强制退出")
+        os._exit(0)
+
+    # 硬超时保护，即便清理线程异常也能退出
+    hard_timeout = cleanup_timeout + 2.0
+    force_timer = threading.Timer(hard_timeout, _force_exit)
+    force_timer.daemon = True
+    force_timer.start()
+
+    def _cleanup_and_exit():
+        try:
+            cleanup_processes_concurrent(timeout=cleanup_timeout)
+        except Exception as exc:  # pragma: no cover
+            logger.exception(f"关机清理异常: {exc}")
+        finally:
+            _log_shutdown_step("清理线程结束，调度主进程退出")
+            _schedule_server_shutdown(0.05)
+
+    threading.Thread(target=_cleanup_and_exit, daemon=True).start()
 
 # 注册清理函数
 atexit.register(cleanup_processes)
@@ -711,7 +949,7 @@ def start_app(app_name):
             processes['forum']['status'] = 'running'
             return jsonify({'success': True, 'message': 'ForumEngine已启动'})
         except Exception as exc:  # pragma: no cover
-            logging.exception("手动启动ForumEngine失败")
+            logger.exception("手动启动ForumEngine失败")
             return jsonify({'success': False, 'message': f'ForumEngine启动失败: {exc}'})
 
     script_path = STREAMLIT_SCRIPTS.get(app_name)
@@ -744,7 +982,7 @@ def stop_app(app_name):
             processes['forum']['status'] = 'stopped'
             return jsonify({'success': True, 'message': 'ForumEngine已停止'})
         except Exception as exc:  # pragma: no cover
-            logging.exception("手动停止ForumEngine失败")
+            logger.exception("手动停止ForumEngine失败")
             return jsonify({'success': False, 'message': f'ForumEngine停止失败: {exc}'})
 
     success, message = stop_streamlit_app(app_name)
@@ -853,6 +1091,57 @@ def get_forum_log():
     except Exception as e:
         return jsonify({'success': False, 'message': f'读取forum.log失败: {str(e)}'})
 
+@app.route('/api/forum/log/history', methods=['POST'])
+def get_forum_log_history():
+    """获取Forum历史日志（支持从指定位置开始）"""
+    try:
+        data = request.get_json()
+        start_position = data.get('position', 0)  # 客户端上次接收的位置
+        max_lines = data.get('max_lines', 1000)   # 最多返回的行数
+
+        forum_log_file = LOG_DIR / "forum.log"
+        if not forum_log_file.exists():
+            return jsonify({
+                'success': True,
+                'log_lines': [],
+                'position': 0,
+                'has_more': False
+            })
+
+        with open(forum_log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            # 从指定位置开始读取
+            f.seek(start_position)
+            lines = []
+            line_count = 0
+
+            for line in f:
+                if line_count >= max_lines:
+                    break
+                line = line.rstrip('\n\r')
+                if line.strip():
+                    # 添加时间戳
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    formatted_line = f"[{timestamp}] {line}"
+                    lines.append(formatted_line)
+                    line_count += 1
+
+            # 记录当前位置
+            current_position = f.tell()
+
+            # 检查是否还有更多内容
+            f.seek(0, 2)  # 移到文件末尾
+            end_position = f.tell()
+            has_more = current_position < end_position
+
+        return jsonify({
+            'success': True,
+            'log_lines': lines,
+            'position': current_position,
+            'has_more': has_more
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'读取forum历史失败: {str(e)}'})
+
 @app.route('/api/search', methods=['POST'])
 def search():
     """统一搜索接口"""
@@ -863,7 +1152,7 @@ def search():
         return jsonify({'success': False, 'message': '搜索查询不能为空'})
     
     # ForumEngine论坛已经在后台运行，会自动检测搜索活动
-    # print("ForumEngine: 搜索请求已收到，论坛将自动检测日志变化")
+    # logger.info("ForumEngine: 搜索请求已收到，论坛将自动检测日志变化")
     
     # 检查哪些应用正在运行
     check_app_status()
@@ -874,7 +1163,7 @@ def search():
     
     # 向运行中的应用发送搜索请求
     results = {}
-    api_ports = {'insight': 8601, 'media': 8602, 'query': 8603}
+    api_ports = {'insight': 8501, 'media': 8502, 'query': 8503}
     
     for app_name in running_apps:
         try:
@@ -909,7 +1198,7 @@ def get_config():
         config_values = read_config_values()
         return jsonify({'success': True, 'config': config_values})
     except Exception as exc:
-        logging.exception("读取配置失败")
+        logger.exception("读取配置失败")
         return jsonify({'success': False, 'message': f'读取配置失败: {exc}'}), 500
 
 
@@ -933,7 +1222,7 @@ def update_config():
         updated_config = read_config_values()
         return jsonify({'success': True, 'config': updated_config})
     except Exception as exc:
-        logging.exception("更新配置失败")
+        logger.exception("更新配置失败")
         return jsonify({'success': False, 'message': f'更新配置失败: {exc}'}), 500
 
 
@@ -969,11 +1258,330 @@ def start_system():
             'errors': errors
         }), 500
     except Exception as exc:  # pragma: no cover - 保底捕获
-        logging.exception("系统启动过程中出现异常")
+        logger.exception("系统启动过程中出现异常")
         _set_system_state(started=False)
         return jsonify({'success': False, 'message': f'系统启动异常: {exc}'}), 500
     finally:
         _set_system_state(starting=False)
+
+@app.route('/api/system/shutdown', methods=['POST'])
+def shutdown_system():
+    """优雅停止所有组件并关闭当前服务进程。"""
+    state = _get_system_state()
+    if state['starting']:
+        return jsonify({'success': False, 'message': '系统正在启动/重启，请稍候'}), 400
+
+    target_ports = [
+        f"{name}:{info['port']}"
+        for name, info in processes.items()
+        if info.get('port')
+    ]
+
+    # 已有关机请求执行中时，返回当前存活的子进程，便于前端判断进度
+    if not _mark_shutdown_requested():
+        running = _describe_running_children()
+        detail = '关机指令已下发，请稍等...'
+        if running:
+            detail = f"关机指令已下发，等待进程退出: {', '.join(running)}"
+        if target_ports:
+            detail = f"{detail}（端口: {', '.join(target_ports)}）"
+        return jsonify({'success': True, 'message': detail, 'ports': target_ports})
+
+    running = _describe_running_children()
+    if running:
+        _log_shutdown_step("开始关闭系统，正在等待子进程退出: " + ", ".join(running))
+    else:
+        _log_shutdown_step("开始关闭系统，未检测到存活子进程")
+
+    try:
+        _set_system_state(started=False, starting=False)
+        _start_async_shutdown(cleanup_timeout=6.0)
+        message = '关闭系统指令已下发，正在停止进程'
+        if running:
+            message = f"{message}: {', '.join(running)}"
+        if target_ports:
+            message = f"{message}（端口: {', '.join(target_ports)}）"
+        return jsonify({'success': True, 'message': message, 'ports': target_ports})
+    except Exception as exc:  # pragma: no cover - 兜底捕获
+        logger.exception("系统关闭过程中出现异常")
+        return jsonify({'success': False, 'message': f'系统关闭异常: {exc}'}), 500
+
+# ==================== GraphRAG API 端点 ====================
+# 前端控制台与 /graph-viewer 调用，均依赖 ReportEngine 在章节目录落盘的 graphrag.json。
+# 若 GRAPHRAG_ENABLED 关闭，这些接口仅返回“未找到图谱”提示。
+
+@app.route('/api/graph/<report_id>')
+def get_graph_data(report_id):
+    """
+    获取指定报告的知识图谱数据。
+    
+    返回格式适合前端 Vis.js 渲染：
+    - nodes: [{id, label, group, title, properties}]
+    - edges: [{from, to, label}]
+    """
+    try:
+        from ReportEngine.graphrag import GraphStorage, Graph
+        
+        # 从默认存储位置查找图谱文件
+        storage = GraphStorage()
+        graph_path = storage.find_graph_by_report_id(report_id)
+        
+        if not graph_path or not graph_path.exists():
+            return jsonify({
+                'success': False,
+                'message': f'未找到报告 {report_id} 的知识图谱数据'
+            }), 404
+        
+        graph = storage.load(graph_path)
+        
+        # 检查图谱是否成功加载（文件可能损坏或格式错误）
+        if graph is None:
+            return jsonify({
+                'success': False,
+                'message': f'图谱文件损坏或格式错误: {report_id}'
+            }), 500
+        
+        # 转换为 Vis.js 格式
+        vis_nodes = []
+        vis_edges = []
+        
+        for node_id, node in graph.nodes.items():
+            vis_nodes.append({
+                'id': node_id,
+                'label': node.label or node_id,
+                'group': node.type,
+                'title': _format_node_tooltip(node),
+                'properties': node.properties
+            })
+        
+        for edge in graph.edges:
+            vis_edges.append({
+                'from': edge.source,
+                'to': edge.target,
+                'label': edge.relation,
+                'arrows': 'to'
+            })
+        
+        return jsonify({
+            'success': True,
+            'graph': {
+                'nodes': vis_nodes,
+                'edges': vis_edges,
+                'stats': graph.get_stats()
+            }
+        })
+        
+    except Exception as e:
+        logger.exception(f"获取图谱数据失败: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'获取图谱数据失败: {str(e)}'
+        }), 500
+
+
+@app.route('/api/graph/latest')
+def get_latest_graph():
+    """获取最近一次生成的知识图谱数据。"""
+    try:
+        from ReportEngine.graphrag import GraphStorage
+        
+        storage = GraphStorage()
+        latest_path = storage.find_latest_graph()
+        
+        if not latest_path or not latest_path.exists():
+            return jsonify({
+                'success': False,
+                'message': '暂无可用的知识图谱数据'
+            }), 404
+        
+        graph = storage.load(latest_path)
+        report_id = latest_path.parent.name if latest_path.parent else 'unknown'
+        
+        # 检查图谱是否成功加载（文件可能损坏或格式错误）
+        if graph is None:
+            return jsonify({
+                'success': False,
+                'message': '图谱文件损坏或格式错误'
+            }), 500
+        
+        # 转换为 Vis.js 格式
+        vis_nodes = []
+        vis_edges = []
+        
+        for node_id, node in graph.nodes.items():
+            vis_nodes.append({
+                'id': node_id,
+                'label': node.label or node_id,
+                'group': node.type,
+                'title': _format_node_tooltip(node),
+                'properties': node.properties
+            })
+        
+        for edge in graph.edges:
+            vis_edges.append({
+                'from': edge.source,
+                'to': edge.target,
+                'label': edge.relation,
+                'arrows': 'to'
+            })
+        
+        return jsonify({
+            'success': True,
+            'report_id': report_id,
+            'graph': {
+                'nodes': vis_nodes,
+                'edges': vis_edges,
+                'stats': graph.get_stats()
+            }
+        })
+        
+    except Exception as e:
+        logger.exception(f"获取最新图谱失败: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'获取最新图谱失败: {str(e)}'
+        }), 500
+
+
+@app.route('/graph-viewer')
+@app.route('/graph-viewer/')
+@app.route('/graph-viewer/<report_id>')
+def graph_viewer(report_id=None):
+    """
+    知识图谱可视化页面。
+    
+    提供交互式图谱展示，支持：
+    - 全屏模式
+    - 缩放、拖拽
+    - 节点详情查看
+    - 筛选和搜索
+    """
+    return render_template('graph_viewer.html', report_id=report_id)
+
+
+@app.route('/api/graph/query', methods=['POST'])
+def query_graph():
+    """
+    查询知识图谱。
+    
+    请求体:
+    {
+        "report_id": "xxx",  // 可选，默认使用最新图谱
+        "keywords": ["关键词1", "关键词2"],
+        "node_types": ["section", "source"],
+        "depth": 2
+    }
+    """
+    try:
+        from ReportEngine.graphrag import GraphStorage, QueryEngine, QueryParams
+        
+        data = request.get_json() or {}
+        report_id = data.get('report_id')
+
+        # 记录查询日志（关键词、过滤条件等）
+        append_knowledge_log(
+            'GRAPH_QUERY',
+            {
+                'report_id': report_id,
+                'keywords': data.get('keywords', []),
+                'node_types': data.get('node_types'),
+                'depth': data.get('depth', 1),
+                'engine_filter': data.get('engine_filter')
+            }
+        )
+        
+        storage = GraphStorage()
+        
+        if report_id:
+            graph_path = storage.find_graph_by_report_id(report_id)
+        else:
+            # 未指定报告ID时默认取最近一次生成的图谱，便于快速试用
+            graph_path = storage.find_latest_graph()
+        
+        if not graph_path or not graph_path.exists():
+            return jsonify({
+                'success': False,
+                'message': '未找到可用的知识图谱'
+            }), 404
+        
+        graph = storage.load(graph_path)
+        
+        # 检查图谱是否成功加载（文件可能损坏或格式错误）
+        if graph is None:
+            return jsonify({
+                'success': False,
+                'message': '图谱文件损坏或格式错误'
+            }), 500
+        
+        query_engine = QueryEngine(graph)
+        
+        params = QueryParams(
+            keywords=data.get('keywords', []),
+            node_types=data.get('node_types'),
+            engine_filter=data.get('engine_filter'),
+            depth=data.get('depth', 1)
+        )
+        
+        result = query_engine.query(params)
+        try:
+            append_knowledge_log(
+                'GRAPH_QUERY_RESULT',
+                {
+                    'report_id': report_id or 'latest',
+                    'counts': {
+                        'matched_sections': len(result.matched_sections),
+                        'matched_queries': len(result.matched_queries),
+                        'matched_sources': len(result.matched_sources),
+                        'total_nodes': result.total_nodes,
+                    },
+                    'query_params': result.query_params,
+                    'matched_sections': _compact_records(result.matched_sections),
+                    'matched_queries': _compact_records(result.matched_queries),
+                    'matched_sources': _compact_records(result.matched_sources),
+                }
+            )
+        except Exception as log_exc:  # pragma: no cover - 日志失败不阻塞主流程
+            logger.warning(f"Knowledge Query: 结果写日志失败: {log_exc}")
+        
+        return jsonify({
+            'success': True,
+            'result': {
+                'matched_sections': result.matched_sections,
+                'matched_queries': result.matched_queries,
+                'matched_sources': result.matched_sources,
+                'total_nodes': result.total_nodes,
+                'query_params': result.query_params,
+                'summary': result.get_summary()
+            }
+        })
+        
+    except Exception as e:
+        logger.exception(f"图谱查询失败: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'图谱查询失败: {str(e)}'
+        }), 500
+
+
+def _format_node_tooltip(node) -> str:
+    """格式化节点悬停提示文本。"""
+    lines = [f"<b>{node.label or node.id}</b>"]
+    lines.append(f"类型: {node.type}")
+    
+    props = node.properties or {}
+    if 'summary' in props:
+        lines.append(f"摘要: {props['summary'][:100]}...")
+    if 'content' in props:
+        lines.append(f"内容: {props['content'][:80]}...")
+    if 'url' in props:
+        lines.append(f"链接: {props['url']}")
+    if 'query' in props:
+        lines.append(f"查询: {props['query']}")
+    
+    return "<br>".join(lines)
+
+
+# ==================== GraphRAG API 端点结束 ====================
 
 @socketio.on('connect')
 def handle_connect():
@@ -993,12 +1601,18 @@ def handle_status_request():
     })
 
 if __name__ == '__main__':
-    print("等待配置确认，系统将在前端指令后启动组件...")
-    print("启动Flask服务器...")
-
+    # 从配置文件读取 HOST 和 PORT
+    from config import settings
+    HOST = settings.HOST
+    PORT = settings.PORT
+    
+    logger.info("等待配置确认，系统将在前端指令后启动组件...")
+    logger.info(f"Flask服务器已启动，访问地址: http://{HOST}:{PORT}")
+    
     try:
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+        socketio.run(app, host=HOST, port=PORT, debug=False)
     except KeyboardInterrupt:
-        print("\n正在关闭应用...")
+        logger.info("\n正在关闭应用...")
         cleanup_processes()
+        
     

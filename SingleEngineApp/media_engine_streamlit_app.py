@@ -9,6 +9,7 @@ import streamlit as st
 from datetime import datetime
 import json
 import locale
+from loguru import logger
 
 # 设置UTF-8编码环境
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -26,13 +27,9 @@ except locale.Error:
 # 添加src目录到Python路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from MediaEngine import DeepSearchAgent, Config
-from config import (
-    MEDIA_ENGINE_API_KEY,
-    MEDIA_ENGINE_BASE_URL,
-    MEDIA_ENGINE_MODEL_NAME,
-    BOCHA_WEB_SEARCH_API_KEY,
-)
+from MediaEngine import DeepSearchAgent, AnspireSearchAgent, Settings
+from config import settings
+from utils.github_issues import error_with_issue_link
 
 
 def main():
@@ -62,16 +59,16 @@ def main():
 
     # ----- 配置被硬编码 -----
     # 强制使用 Gemini
-    model_name = MEDIA_ENGINE_MODEL_NAME or "gemini-2.5-pro"
+    model_name = settings.MEDIA_ENGINE_MODEL_NAME or "gemini-2.5-pro"
     # 默认高级配置
     max_reflections = 2
     max_content_length = 20000
 
     # 简化的研究查询展示区域
-    
+
     # 如果有自动查询，使用它作为默认值，否则显示占位符
     display_query = auto_query if auto_query else "等待从主页面接收分析内容..."
-    
+
     # 只读的查询展示区域
     st.text_area(
         "当前查询",
@@ -85,7 +82,7 @@ def main():
     # 自动搜索逻辑
     start_research = False
     query = auto_query
-    
+
     if auto_search and auto_query and 'auto_search_executed' not in st.session_state:
         st.session_state.auto_search_executed = True
         start_research = True
@@ -96,36 +93,63 @@ def main():
     if start_research:
         if not query.strip():
             st.error("请输入研究查询")
+            logger.error("请输入研究查询")
             return
 
         # 由于强制使用Gemini，检查相关的API密钥
-        if not MEDIA_ENGINE_API_KEY:
-            st.error("请在您的配置文件(config.py)中设置MEDIA_ENGINE_API_KEY")
-            return
-        if not BOCHA_WEB_SEARCH_API_KEY:
-            st.error("请在您的配置文件(config.py)中设置BOCHA_WEB_SEARCH_API_KEY")
+        if not settings.MEDIA_ENGINE_API_KEY:
+            st.error("请在您的环境变量中设置MEDIA_ENGINE_API_KEY")
+            logger.error("请在您的环境变量中设置MEDIA_ENGINE_API_KEY")
             return
 
         # 自动使用配置文件中的API密钥
-        engine_key = MEDIA_ENGINE_API_KEY
-        bocha_key = BOCHA_WEB_SEARCH_API_KEY
+        engine_key = settings.MEDIA_ENGINE_API_KEY
+        bocha_key = settings.BOCHA_WEB_SEARCH_API_KEY
+        ansire_key = settings.ANSPIRE_API_KEY
 
-        # 创建配置
-        config = Config(
-            llm_api_key=engine_key,
-            llm_base_url=MEDIA_ENGINE_BASE_URL,
-            llm_model_name=model_name,
-            bocha_api_key=bocha_key,
-            max_reflections=max_reflections,
-            max_content_length=max_content_length,
-            output_dir="media_engine_streamlit_reports"
-        )
+        # 构建 Settings（pydantic_settings风格，优先大写环境变量）
+        if settings.SEARCH_TOOL_TYPE == "BochaAPI":
+            if not bocha_key:
+                st.error("请在您的环境变量中设置BOCHA_WEB_SEARCH_API_KEY")
+                logger.error("请在您的环境变量中设置BOCHA_WEB_SEARCH_API_KEY")
+                return
+            logger.info("使用Bocha搜索API密钥")
+            config = Settings(
+                MEDIA_ENGINE_API_KEY=engine_key,
+                MEDIA_ENGINE_BASE_URL=settings.MEDIA_ENGINE_BASE_URL,
+                MEDIA_ENGINE_MODEL_NAME=model_name,
+                SEARCH_TOOL_TYPE="BochaAPI",
+                BOCHA_WEB_SEARCH_API_KEY=bocha_key,
+                MAX_REFLECTIONS=max_reflections,
+                SEARCH_CONTENT_MAX_LENGTH=max_content_length,
+                OUTPUT_DIR="media_engine_streamlit_reports",
+            )
+        elif settings.SEARCH_TOOL_TYPE == "AnspireAPI":
+            if not ansire_key:
+                st.error("请在您的环境变量中设置ANSPIRE_API_KEY")
+                logger.error("请在您的环境变量中设置ANSPIRE_API_KEY")
+                return
+            logger.info("使用Anspire搜索API密钥")
+            config = Settings(
+                MEDIA_ENGINE_API_KEY=engine_key,
+                MEDIA_ENGINE_BASE_URL=settings.MEDIA_ENGINE_BASE_URL,
+                MEDIA_ENGINE_MODEL_NAME=model_name,
+                SEARCH_TOOL_TYPE="AnspireAPI",
+                ANSPIRE_API_KEY=ansire_key,
+                MAX_REFLECTIONS=max_reflections,
+                SEARCH_CONTENT_MAX_LENGTH=max_content_length,
+                OUTPUT_DIR="media_engine_streamlit_reports",
+            )
+        else:
+            st.error(f"未知的搜索工具类型: {settings.SEARCH_TOOL_TYPE}")
+            logger.error(f"未知的搜索工具类型: {settings.SEARCH_TOOL_TYPE}")
+            return
 
         # 执行研究
         execute_research(query, config)
 
 
-def execute_research(query: str, config: Config):
+def execute_research(query: str, config: Settings):
     """执行研究"""
     try:
         # 创建进度条
@@ -134,7 +158,12 @@ def execute_research(query: str, config: Config):
 
         # 初始化Agent
         status_text.text("正在初始化Agent...")
-        agent = DeepSearchAgent(config)
+        if config.SEARCH_TOOL_TYPE == "BochaAPI":
+            agent = DeepSearchAgent(config)
+        elif config.SEARCH_TOOL_TYPE == "AnspireAPI":
+            agent = AnspireSearchAgent(config)
+        else:
+            raise ValueError(f"未知的搜索工具类型: {config.SEARCH_TOOL_TYPE}")
         st.session_state.agent = agent
 
         progress_bar.progress(10)
@@ -163,21 +192,31 @@ def execute_research(query: str, config: Config):
 
         # 生成最终报告
         status_text.text("正在生成最终报告...")
+        logger.info("正在生成最终报告...")
         final_report = agent._generate_final_report()
         progress_bar.progress(90)
 
         # 保存报告
         status_text.text("正在保存报告...")
+        logger.info("正在保存报告...")
         agent._save_report(final_report)
         progress_bar.progress(100)
 
         status_text.text("研究完成！")
-
+        logger.info("研究完成！")
         # 显示结果
         display_results(agent, final_report)
 
     except Exception as e:
-        st.error(f"研究过程中发生错误: {str(e)}")
+        import traceback
+        error_traceback = traceback.format_exc()
+        error_display = error_with_issue_link(
+            f"研究过程中发生错误: {str(e)}",
+            error_traceback,
+            app_name="Media Engine Streamlit App"
+        )
+        st.error(error_display)
+        logger.exception(f"研究过程中发生错误: {str(e)}")
 
 
 def display_results(agent: DeepSearchAgent, final_report: str):
@@ -210,11 +249,23 @@ def display_results(agent: DeepSearchAgent, final_report: str):
 
         if all_searches:
             for i, search in enumerate(all_searches):
-                with st.expander(f"搜索 {i + 1}: {search.query}"):
-                    st.write("**URL:**", search.url)
-                    st.write("**标题:**", search.title)
-                    st.write("**内容预览:**",
-                             search.content[:200] + "..." if len(search.content) > 200 else search.content)
+                query_label = search.query if search.query else "未记录查询"
+                with st.expander(f"搜索 {i + 1}: {query_label}"):
+                    paragraph_title = getattr(search, "paragraph_title", "") or "未标注段落"
+                    search_tool = getattr(search, "search_tool", "") or "未标注工具"
+                    has_result = getattr(search, "has_result", True)
+                    st.write("**段落:**", paragraph_title)
+                    st.write("**使用的工具:**", search_tool)
+                    preview = search.content or ""
+                    if not isinstance(preview, str):
+                        preview = str(preview)
+                    if len(preview) > 200:
+                        preview = preview[:200] + "..."
+                    st.write("**URL:**", search.url or "无")
+                    st.write("**标题:**", search.title or "无")
+                    st.write("**内容预览:**", preview if preview else "无可用内容")
+                    if not has_result:
+                        st.info("本次搜索未返回结果")
                     if search.score:
                         st.write("**相关度评分:**", search.score)
 

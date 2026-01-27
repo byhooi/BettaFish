@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy import inspect, text
 from config import settings
 from loguru import logger
+from urllib.parse import quote_plus
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
@@ -60,7 +61,7 @@ class MindSpider:
         
         if missing_configs:
             logger.error(f"配置缺失: {', '.join(missing_configs)}")
-            logger.error("请检查config.py文件中的配置信息")
+            logger.error("请检查.env文件中的环境变量配置信息")
             return False
         
         logger.info("基础配置检查通过")
@@ -73,10 +74,10 @@ class MindSpider:
         def build_async_url() -> str:
             dialect = (settings.DB_DIALECT or "mysql").lower()
             if dialect == "postgresql":
-                return f"postgresql+asyncpg://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+                return f"postgresql+asyncpg://{settings.DB_USER}:{quote_plus(settings.DB_PASSWORD)}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
             # 默认使用 mysql 异步驱动 asyncmy
             return (
-                f"mysql+asyncmy://{settings.DB_USER}:{settings.DB_PASSWORD}"
+                f"mysql+asyncmy://{settings.DB_USER}:{quote_plus(settings.DB_PASSWORD)}"
                 f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}?charset={settings.DB_CHARSET}"
             )
 
@@ -104,9 +105,9 @@ class MindSpider:
         def build_async_url() -> str:
             dialect = (settings.DB_DIALECT or "mysql").lower()
             if dialect == "postgresql":
-                return f"postgresql+asyncpg://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+                return f"postgresql+asyncpg://{settings.DB_USER}:{quote_plus(settings.DB_PASSWORD)}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
             return (
-                f"mysql+asyncmy://{settings.DB_USER}:{settings.DB_PASSWORD}"
+                f"mysql+asyncmy://{settings.DB_USER}:{quote_plus(settings.DB_PASSWORD)}"
                 f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}?charset={settings.DB_CHARSET}"
             )
 

@@ -11,13 +11,14 @@ import re
 import json
 from typing import Dict, Optional, List
 from threading import Lock
+from loguru import logger
 
 # 导入论坛主持人模块
 try:
     from .llm_host import generate_host_speech
     HOST_AVAILABLE = True
 except ImportError:
-    print("ForumEngine: 论坛主持人模块未找到，将以纯监控模式运行")
+    logger.exception("ForumEngine: 论坛主持人模块未找到，将以纯监控模式运行")
     HOST_AVAILABLE = False
 
 class LogMonitor:
@@ -49,16 +50,27 @@ class LogMonitor:
         self.host_speech_threshold = 5  # 每5条agent发言触发一次主持人发言
         self.is_host_generating = False  # 主持人是否正在生成发言
        
-        # 目标节点名称 - 直接匹配字符串
-        self.target_nodes = [
-            'FirstSummaryNode',
-            'ReflectionSummaryNode'
+        # 目标节点识别模式
+        # 1. 类名（旧格式可能包含）
+        # 2. 完整模块路径（实际日志格式，包含引擎前缀）
+        # 3. 部分模块路径（兼容性）
+        # 4. 关键标识文本
+        self.target_node_patterns = [
+            'FirstSummaryNode',  # 类名
+            'ReflectionSummaryNode',  # 类名
+            'InsightEngine.nodes.summary_node',  # InsightEngine完整路径
+            'MediaEngine.nodes.summary_node',  # MediaEngine完整路径
+            'QueryEngine.nodes.summary_node',  # QueryEngine完整路径
+            'nodes.summary_node',  # 模块路径（兼容性，用于部分匹配）
+            '正在生成首次段落总结',  # FirstSummaryNode的标识
+            '正在生成反思总结',  # ReflectionSummaryNode的标识
         ]
         
         # 多行内容捕获状态
         self.capturing_json = {}  # 每个app的JSON捕获状态
         self.json_buffer = {}     # 每个app的JSON缓冲区
         self.json_start_line = {} # 每个app的JSON开始行
+        self.in_error_block = {}  # 每个app是否在ERROR块中
        
         # 确保logs目录存在
         self.log_dir.mkdir(exist_ok=True)
@@ -76,19 +88,20 @@ class LogMonitor:
                 pass  # 先创建空文件
             self.write_to_forum_log(f"=== ForumEngine 监控开始 - {start_time} ===", "SYSTEM")
                
-            print(f"ForumEngine: forum.log 已清空并初始化")
+            logger.info(f"ForumEngine: forum.log 已清空并初始化")
             
             # 重置JSON捕获状态
             self.capturing_json = {}
             self.json_buffer = {}
             self.json_start_line = {}
+            self.in_error_block = {}
             
             # 重置主持人相关状态
             self.agent_speeches_buffer = []
             self.is_host_generating = False
            
         except Exception as e:
-            print(f"ForumEngine: 清空forum.log失败: {e}")
+            logger.exception(f"ForumEngine: 清空forum.log失败: {e}")
    
     def write_to_forum_log(self, content: str, source: str = None):
         """写入内容到forum.log（线程安全）"""
@@ -105,13 +118,54 @@ class LogMonitor:
                         f.write(f"[{timestamp}] {content_one_line}\n")
                     f.flush()
         except Exception as e:
-            print(f"ForumEngine: 写入forum.log失败: {e}")
-   
+            logger.exception(f"ForumEngine: 写入forum.log失败: {e}")
+    
+    def get_log_level(self, line: str) -> Optional[str]:
+        """检测日志行的级别（INFO/ERROR/WARNING/DEBUG等）
+        
+        支持loguru格式：YYYY-MM-DD HH:mm:ss.SSS | LEVEL | ...
+        
+        Returns:
+            'INFO', 'ERROR', 'WARNING', 'DEBUG' 或 None（无法识别）
+        """
+        # 检查loguru格式：YYYY-MM-DD HH:mm:ss.SSS | LEVEL | ...
+        # 匹配模式：| LEVEL | 或 | LEVEL     |
+        match = re.search(r'\|\s*(INFO|ERROR|WARNING|DEBUG|TRACE|CRITICAL)\s*\|', line)
+        if match:
+            return match.group(1)
+        return None
+    
     def is_target_log_line(self, line: str) -> bool:
-        """检查是否是目标日志行（SummaryNode）"""
-        # 简单字符串包含检查，更可靠
-        for node_name in self.target_nodes:
-            if node_name in line:
+        """检查是否是目标日志行（SummaryNode）
+        
+        支持多种识别方式：
+        1. 类名：FirstSummaryNode, ReflectionSummaryNode
+        2. 完整模块路径：InsightEngine.nodes.summary_node、MediaEngine.nodes.summary_node、QueryEngine.nodes.summary_node
+        3. 部分模块路径：nodes.summary_node（兼容性）
+        4. 关键标识文本：正在生成首次段落总结、正在生成反思总结
+        
+        排除条件：
+        - ERROR 级别的日志（错误日志不应被识别为目标节点）
+        - 包含错误关键词的日志（JSON解析失败、JSON修复失败等）
+        """
+        # 排除 ERROR 级别的日志
+        log_level = self.get_log_level(line)
+        if log_level == 'ERROR':
+            return False
+        
+        # 兼容旧检查方式
+        if "| ERROR" in line or "| ERROR    |" in line:
+            return False
+        
+        # 排除包含错误关键词的日志
+        error_keywords = ["JSON解析失败", "JSON修复失败", "Traceback", "File \""]
+        for keyword in error_keywords:
+            if keyword in line:
+                return False
+        
+        # 检查是否包含目标节点模式
+        for pattern in self.target_node_patterns:
+            if pattern in line:
                 return True
         return False
     
@@ -144,7 +198,10 @@ class LogMonitor:
                 return False
         
         # 如果行长度过短，也认为不是有价值的内容
-        clean_line = re.sub(r'\[\d{2}:\d{2}:\d{2}\]', '', line).strip()
+        # 移除时间戳：支持旧格式和新格式
+        clean_line = re.sub(r'\[\d{2}:\d{2}:\d{2}\]', '', line)
+        clean_line = re.sub(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s*\|\s*[A-Z]+\s*\|\s*[^|]+?\s*-\s*', '', clean_line)
+        clean_line = clean_line.strip()
         if len(clean_line) < 30:  # 阈值可以调整
             return False
             
@@ -155,9 +212,25 @@ class LogMonitor:
         return "清理后的输出: {" in line
     
     def is_json_end_line(self, line: str) -> bool:
-        """判断是否是JSON结束行"""
+        """判断是否是JSON结束行
+        
+        只判断纯粹的结束标记行，不包含任何日志格式信息（时间戳等）。
+        如果行包含时间戳，应该先清理再判断，但这里返回False表示需要进一步处理。
+        """
         stripped = line.strip()
-        return stripped == "}" or (stripped.startswith("[") and stripped.endswith("] }"))
+        
+        # 如果行包含时间戳（旧格式或新格式），说明不是纯粹的结束行
+        # 旧格式：[HH:MM:SS]
+        if re.match(r'^\[\d{2}:\d{2}:\d{2}\]', stripped):
+            return False
+        # 新格式：YYYY-MM-DD HH:mm:ss.SSS
+        if re.match(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}', stripped):
+            return False
+        
+        # 不包含时间戳的行，检查是否是纯结束标记
+        if stripped == "}" or stripped == "] }":
+            return True
+        return False
     
     def extract_json_content(self, json_lines: List[str]) -> Optional[str]:
         """从多行中提取并解析JSON内容"""
@@ -199,8 +272,12 @@ class LogMonitor:
             # 处理多行JSON
             json_text = json_part
             for line in json_lines[json_start_idx + 1:]:
-                # 移除时间戳
+                # 移除时间戳：支持旧格式 [HH:MM:SS] 和新格式 loguru (YYYY-MM-DD HH:mm:ss.SSS | LEVEL | ...)
+                # 旧格式：[HH:MM:SS]
                 clean_line = re.sub(r'^\[\d{2}:\d{2}:\d{2}\]\s*', '', line)
+                # 新格式：移除 loguru 格式的时间戳和级别信息
+                # 格式: YYYY-MM-DD HH:mm:ss.SSS | LEVEL | module:function:line -
+                clean_line = re.sub(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s*\|\s*[A-Z]+\s*\|\s*[^|]+?\s*-\s*', '', clean_line)
                 json_text += clean_line
             
             # 尝试解析JSON
@@ -241,47 +318,56 @@ class LogMonitor:
             return f"清理后的输出: {json.dumps(json_obj, ensure_ascii=False, indent=2)}"
             
         except Exception as e:
-            print(f"ForumEngine: 格式化JSON时出错: {e}")
+            logger.exception(f"ForumEngine: 格式化JSON时出错: {e}")
             return f"清理后的输出: {json.dumps(json_obj, ensure_ascii=False, indent=2)}"
 
     def extract_node_content(self, line: str) -> Optional[str]:
         """提取节点内容，去除时间戳、节点名称等前缀"""
-        # 移除时间戳部分
-        # 格式: [HH:MM:SS] [NodeName] message
-        match = re.search(r'\[\d{2}:\d{2}:\d{2}\]\s*(.+)', line)
-        if match:
-            content = match.group(1).strip()
-            
-            # 移除所有的方括号标签（包括节点名称和应用名称）
+        content = line
+        
+        # 移除时间戳部分：支持旧格式和新格式
+        # 旧格式: [HH:MM:SS]
+        match_old = re.search(r'\[\d{2}:\d{2}:\d{2}\]\s*(.+)', content)
+        if match_old:
+            content = match_old.group(1).strip()
+        else:
+            # 新格式: YYYY-MM-DD HH:mm:ss.SSS | LEVEL | module:function:line -
+            match_new = re.search(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s*\|\s*[A-Z]+\s*\|\s*[^|]+?\s*-\s*(.+)', content)
+            if match_new:
+                content = match_new.group(1).strip()
+        
+        if not content:
+            return line.strip()
+        
+        # 移除所有的方括号标签（包括节点名称和应用名称）
+        content = re.sub(r'^\[.*?\]\s*', '', content)
+        
+        # 继续移除可能的多个连续标签
+        while re.match(r'^\[.*?\]\s*', content):
             content = re.sub(r'^\[.*?\]\s*', '', content)
-            
-            # 继续移除可能的多个连续标签
-            while re.match(r'^\[.*?\]\s*', content):
-                content = re.sub(r'^\[.*?\]\s*', '', content)
-            
-            # 移除常见前缀（如"首次总结: "、"反思总结: "等）
-            prefixes_to_remove = [
-                "首次总结: ",
-                "反思总结: ",
-                "清理后的输出: "
-            ]
-            
-            for prefix in prefixes_to_remove:
-                if content.startswith(prefix):
-                    content = content[len(prefix):]
-                    break
-            
-            # 移除可能存在的应用名标签（不在方括号内的）
-            app_names = ['INSIGHT', 'MEDIA', 'QUERY']
-            for app_name in app_names:
-                # 移除单独的APP_NAME（在行首）
-                content = re.sub(rf'^{app_name}\s+', '', content, flags=re.IGNORECASE)
-            
-            # 清理多余的空格
-            content = re.sub(r'\s+', ' ', content)
-            
-            return content.strip()
-        return line.strip()
+        
+        # 移除常见前缀（如"首次总结: "、"反思总结: "等）
+        prefixes_to_remove = [
+            "首次总结: ",
+            "反思总结: ",
+            "清理后的输出: "
+        ]
+        
+        for prefix in prefixes_to_remove:
+            if content.startswith(prefix):
+                content = content[len(prefix):]
+                break
+        
+        # 移除可能存在的应用名标签（不在方括号内的）
+        app_names = ['INSIGHT', 'MEDIA', 'QUERY']
+        for app_name in app_names:
+            # 移除单独的APP_NAME（在行首）
+            content = re.sub(rf'^{app_name}\s+', '', content, flags=re.IGNORECASE)
+        
+        # 清理多余的空格
+        content = re.sub(r'\s+', ' ', content)
+        
+        return content.strip()
    
     def get_file_size(self, file_path: Path) -> int:
         """获取文件大小"""
@@ -317,6 +403,7 @@ class LogMonitor:
                 # 重置JSON捕获状态
                 self.capturing_json[app_name] = False
                 self.json_buffer[app_name] = []
+                self.in_error_block[app_name] = False
            
             if current_size > last_position:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -331,53 +418,96 @@ class LogMonitor:
                     new_lines = [line.strip() for line in new_lines if line.strip()]
                    
         except Exception as e:
-            print(f"ForumEngine: 读取{app_name}日志失败: {e}")
+            logger.exception(f"ForumEngine: 读取{app_name}日志失败: {e}")
        
         return new_lines
    
     def process_lines_for_json(self, lines: List[str], app_name: str) -> List[str]:
-        """处理行以捕获多行JSON内容"""
+        """处理行以捕获多行JSON内容
+        
+        实现ERROR块过滤：如果遇到ERROR级别的日志，拒绝处理直到遇到下一个INFO级别的日志
+        """
         captured_contents = []
         
         # 初始化状态
         if app_name not in self.capturing_json:
             self.capturing_json[app_name] = False
             self.json_buffer[app_name] = []
+        if app_name not in self.in_error_block:
+            self.in_error_block[app_name] = False
         
         for line in lines:
             if not line.strip():
                 continue
+            
+            # 首先检查日志级别，更新ERROR块状态
+            log_level = self.get_log_level(line)
+            if log_level == 'ERROR':
+                # 遇到ERROR，进入ERROR块状态
+                self.in_error_block[app_name] = True
+                # 如果正在捕获JSON，立即停止并清空缓冲区
+                if self.capturing_json[app_name]:
+                    self.capturing_json[app_name] = False
+                    self.json_buffer[app_name] = []
+                # 跳过当前行，不处理
+                continue
+            elif log_level == 'INFO':
+                # 遇到INFO，退出ERROR块状态
+                self.in_error_block[app_name] = False
+            # 其他级别（WARNING、DEBUG等）保持当前状态
+            
+            # 如果在ERROR块中，拒绝处理所有内容
+            if self.in_error_block[app_name]:
+                # 如果正在捕获JSON，立即停止并清空缓冲区
+                if self.capturing_json[app_name]:
+                    self.capturing_json[app_name] = False
+                    self.json_buffer[app_name] = []
+                # 跳过当前行，不处理
+                continue
                 
-            # 检查是否是目标节点行
-            if self.is_target_log_line(line):
-                if self.is_json_start_line(line):
-                    # 开始捕获JSON
-                    self.capturing_json[app_name] = True
-                    self.json_buffer[app_name] = [line]
-                    self.json_start_line[app_name] = line
+            # 检查是否是目标节点行和JSON开始标记
+            is_target = self.is_target_log_line(line)
+            is_json_start = self.is_json_start_line(line)
+            
+            # 只有目标节点（SummaryNode）的JSON输出才应该被捕获
+            # 过滤掉SearchNode等其他节点的输出（它们不是目标节点，即使有JSON也不会被捕获）
+            if is_target and is_json_start:
+                # 开始捕获JSON（必须是目标节点且包含"清理后的输出: {"）
+                self.capturing_json[app_name] = True
+                self.json_buffer[app_name] = [line]
+                self.json_start_line[app_name] = line
+                
+                # 检查是否是单行JSON
+                if line.strip().endswith("}"):
+                    # 单行JSON，立即处理
+                    content = self.extract_json_content([line])
+                    if content:  # 只有成功解析的内容才会被记录
+                        # 去除重复的标签和格式化
+                        clean_content = self._clean_content_tags(content, app_name)
+                        captured_contents.append(f"{clean_content}")
+                    self.capturing_json[app_name] = False
+                    self.json_buffer[app_name] = []
                     
-                    # 检查是否是单行JSON
-                    if line.strip().endswith("}"):
-                        # 单行JSON，立即处理
-                        content = self.extract_json_content([line])
-                        if content:  # 只有成功解析的内容才会被记录
-                            # 去除重复的标签和格式化
-                            clean_content = self._clean_content_tags(content, app_name)
-                            captured_contents.append(f"{clean_content}")
-                        self.capturing_json[app_name] = False
-                        self.json_buffer[app_name] = []
-                        
-                elif self.is_valuable_content(line):
-                    # 其他有价值的SummaryNode内容
-                    clean_content = self._clean_content_tags(self.extract_node_content(line), app_name)
-                    captured_contents.append(f"{clean_content}")
+            elif is_target and self.is_valuable_content(line):
+                # 其他有价值的SummaryNode内容（必须是目标节点且有价值）
+                clean_content = self._clean_content_tags(self.extract_node_content(line), app_name)
+                captured_contents.append(f"{clean_content}")
                     
             elif self.capturing_json[app_name]:
                 # 正在捕获JSON的后续行
                 self.json_buffer[app_name].append(line)
                 
                 # 检查是否是JSON结束
-                if self.is_json_end_line(line):
+                # 先清理时间戳，然后判断清理后的行是否是结束标记
+                cleaned_line = line.strip()
+                # 清理旧格式时间戳：[HH:MM:SS]
+                cleaned_line = re.sub(r'^\[\d{2}:\d{2}:\d{2}\]\s*', '', cleaned_line)
+                # 清理新格式时间戳：YYYY-MM-DD HH:mm:ss.SSS | LEVEL | module:function:line -
+                cleaned_line = re.sub(r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s*\|\s*[A-Z]+\s*\|\s*[^|]+?\s*-\s*', '', cleaned_line)
+                cleaned_line = cleaned_line.strip()
+                
+                # 清理后判断是否是结束标记
+                if cleaned_line == "}" or cleaned_line == "] }":
                     # JSON结束，处理完整的JSON
                     content = self.extract_json_content(self.json_buffer[app_name])
                     if content:  # 只有成功解析的内容才会被记录
@@ -406,7 +536,7 @@ class LogMonitor:
                 self.is_host_generating = False
                 return
             
-            print("ForumEngine: 正在生成主持人发言...")
+            logger.info("ForumEngine: 正在生成主持人发言...")
             
             # 调用主持人生成发言（传入最近5条）
             host_speech = generate_host_speech(recent_speeches)
@@ -414,18 +544,18 @@ class LogMonitor:
             if host_speech:
                 # 写入主持人发言到forum.log
                 self.write_to_forum_log(host_speech, "HOST")
-                print(f"ForumEngine: 主持人发言已记录")
+                logger.info(f"ForumEngine: 主持人发言已记录")
                 
                 # 清空已处理的5条发言
                 self.agent_speeches_buffer = self.agent_speeches_buffer[5:]
             else:
-                print("ForumEngine: 主持人发言生成失败")
+                logger.error("ForumEngine: 主持人发言生成失败")
             
             # 重置生成标志
             self.is_host_generating = False
                 
         except Exception as e:
-            print(f"ForumEngine: 触发主持人发言时出错: {e}")
+            logger.exception(f"ForumEngine: 触发主持人发言时出错: {e}")
             self.is_host_generating = False
     
     def _clean_content_tags(self, content: str, app_name: str) -> str:
@@ -453,7 +583,7 @@ class LogMonitor:
    
     def monitor_logs(self):
         """智能监控日志文件"""
-        print("ForumEngine: 论坛创建中...")
+        logger.info("ForumEngine: 论坛创建中...")
        
         # 初始化文件行数和位置 - 记录当前状态作为基线
         for app_name, log_file in self.monitored_logs.items():
@@ -461,7 +591,8 @@ class LogMonitor:
             self.file_positions[app_name] = self.get_file_size(log_file)
             self.capturing_json[app_name] = False
             self.json_buffer[app_name] = []
-            # print(f"ForumEngine: {app_name} 基线行数: {self.file_line_counts[app_name]}")
+            self.in_error_block[app_name] = False
+            # logger.info(f"ForumEngine: {app_name} 基线行数: {self.file_line_counts[app_name]}")
        
         while self.is_monitoring:
             try:
@@ -483,13 +614,16 @@ class LogMonitor:
                         # 先检查是否需要触发搜索（只触发一次）
                         if not self.is_searching:
                             for line in new_lines:
-                                if line.strip() and 'FirstSummaryNode' in line:
-                                    print(f"ForumEngine: 在{app_name}中检测到第一次论坛发表内容")
-                                    self.is_searching = True
-                                    self.search_inactive_count = 0
-                                    # 清空forum.log开始新会话
-                                    self.clear_forum_log()
-                                    break  # 找到一个就够了，跳出循环
+                                # 检查是否包含目标节点模式（支持多种格式）
+                                if line.strip() and self.is_target_log_line(line):
+                                    # 进一步确认是首次总结节点（FirstSummaryNode或包含"正在生成首次段落总结"）
+                                    if 'FirstSummaryNode' in line or '正在生成首次段落总结' in line:
+                                        logger.info(f"ForumEngine: 在{app_name}中检测到第一次论坛发表内容")
+                                        self.is_searching = True
+                                        self.search_inactive_count = 0
+                                        # 清空forum.log开始新会话
+                                        self.clear_forum_log()
+                                        break  # 找到一个就够了，跳出循环
                        
                         # 处理所有新增内容（如果正在搜索状态）
                         if self.is_searching:
@@ -500,7 +634,7 @@ class LogMonitor:
                                 # 将app_name转换为大写作为标签（如 insight -> INSIGHT）
                                 source_tag = app_name.upper()
                                 self.write_to_forum_log(content, source_tag)
-                                # print(f"ForumEngine: 捕获 - {content}")
+                                # logger.info(f"ForumEngine: 捕获 - {content}")
                                 captured_any = True
                                 
                                 # 将发言添加到缓冲区（格式化为完整的日志行）
@@ -515,12 +649,13 @@ class LogMonitor:
                    
                     elif current_lines < previous_lines:
                         any_shrink = True
-                        # print(f"ForumEngine: 检测到 {app_name} 日志缩短，将重置基线")
+                        # logger.info(f"ForumEngine: 检测到 {app_name} 日志缩短，将重置基线")
                         # 重置文件位置到新的文件末尾
                         self.file_positions[app_name] = self.get_file_size(log_file)
                         # 重置JSON捕获状态
                         self.capturing_json[app_name] = False
                         self.json_buffer[app_name] = []
+                        self.in_error_block[app_name] = False
                    
                     # 更新行数记录
                     self.file_line_counts[app_name] = current_lines
@@ -529,7 +664,7 @@ class LogMonitor:
                 if self.is_searching:
                     if any_shrink:
                         # log变短，结束当前搜索会话，重置为等待状态
-                        # print("ForumEngine: 日志缩短，结束当前搜索会话，回到等待状态")
+                        # logger.info("ForumEngine: 日志缩短，结束当前搜索会话，回到等待状态")
                         self.is_searching = False
                         self.search_inactive_count = 0
                         # 重置主持人相关状态
@@ -538,12 +673,12 @@ class LogMonitor:
                         # 写入结束标记
                         end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         self.write_to_forum_log(f"=== ForumEngine 论坛结束 - {end_time} ===", "SYSTEM")
-                        # print("ForumEngine: 已重置基线，等待下次FirstSummaryNode触发")
+                        # logger.info("ForumEngine: 已重置基线，等待下次FirstSummaryNode触发")
                     elif not any_growth and not captured_any:
                         # 没有增长也没有捕获内容，增加非活跃计数
                         self.search_inactive_count += 1
-                        if self.search_inactive_count >= 900:  # 15分钟无活动才结束
-                            print("ForumEngine: 长时间无活动，结束论坛")
+                        if self.search_inactive_count >= 7200:  # 超时无活动自动结束
+                            logger.info("ForumEngine: 长时间无活动，结束论坛")
                             self.is_searching = False
                             self.search_inactive_count = 0
                             # 重置主持人相关状态
@@ -559,17 +694,17 @@ class LogMonitor:
                 time.sleep(1)
                
             except Exception as e:
-                print(f"ForumEngine: 论坛记录中出错: {e}")
+                logger.exception(f"ForumEngine: 论坛记录中出错: {e}")
                 import traceback
                 traceback.print_exc()
                 time.sleep(2)
        
-        print("ForumEngine: 停止论坛日志文件")
+        logger.info("ForumEngine: 停止论坛日志文件")
    
     def start_monitoring(self):
         """开始智能监控"""
         if self.is_monitoring:
-            print("ForumEngine: 论坛已经在运行中")
+            logger.info("ForumEngine: 论坛已经在运行中")
             return False
        
         try:
@@ -578,18 +713,18 @@ class LogMonitor:
             self.monitor_thread = threading.Thread(target=self.monitor_logs, daemon=True)
             self.monitor_thread.start()
            
-            print("ForumEngine: 论坛已启动")
+            logger.info("ForumEngine: 论坛已启动")
             return True
            
         except Exception as e:
-            print(f"ForumEngine: 启动论坛失败: {e}")
+            logger.exception(f"ForumEngine: 启动论坛失败: {e}")
             self.is_monitoring = False
             return False
    
     def stop_monitoring(self):
         """停止监控"""
         if not self.is_monitoring:
-            print("ForumEngine: 论坛未运行")
+            logger.info("ForumEngine: 论坛未运行")
             return
        
         try:
@@ -602,10 +737,10 @@ class LogMonitor:
             end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.write_to_forum_log(f"=== ForumEngine 论坛结束 - {end_time} ===", "SYSTEM")
            
-            print("ForumEngine: 论坛已停止")
+            logger.info("ForumEngine: 论坛已停止")
            
         except Exception as e:
-            print(f"ForumEngine: 停止论坛失败: {e}")
+            logger.exception(f"ForumEngine: 停止论坛失败: {e}")
    
     def get_forum_log_content(self) -> List[str]:
         """获取forum.log的内容"""
@@ -617,7 +752,7 @@ class LogMonitor:
                 return [line.rstrip('\n\r') for line in f.readlines()]
                
         except Exception as e:
-            print(f"ForumEngine: 读取forum.log失败: {e}")
+            logger.exception(f"ForumEngine: 读取forum.log失败: {e}")
             return []
 
     def fix_json_string(self, json_text: str) -> str:
